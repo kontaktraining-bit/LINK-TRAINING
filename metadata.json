@@ -1,0 +1,6 @@
+{
+  "name": "Pengelola Link & URL",
+  "description": "Aplikasi web modern untuk menyimpan, mengkategorikan, mencari, dan mengelola tautan URL dengan penyimpanan lokal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
