@@ -1,16 +1,10 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import { User } from 'firebase/auth';
 import { LinkItem, ViewMode, SortField, ToastMessage } from './types';
 import { loadLinks, saveLinks, clearAllLinks } from './utils/storage';
 import {
-  initAuth,
-  googleSignIn,
-  googleLogout,
-  getAccessToken,
-} from './services/googleAuth';
-import {
-  fetchLinksFromGoogleSheet,
-  syncAllLinksToGoogleSheet,
+  fetchLinksDirectlyFromGoogleSheet,
+  sendActionToGoogleSheetsWebhook,
+  getSavedWebhookUrl,
   SPREADSHEET_URL,
 } from './services/sheetsService';
 import { Header } from './components/Header';
@@ -21,6 +15,7 @@ import { LinkList } from './components/LinkList';
 import { LinkModal } from './components/LinkModal';
 import { ConfirmModal } from './components/ConfirmModal';
 import { ImportExportModal } from './components/ImportExportModal';
+import { SheetsSettingsModal } from './components/SheetsSettingsModal';
 import { Toast } from './components/Toast';
 
 export default function App() {
@@ -28,11 +23,11 @@ export default function App() {
   const [editingLink, setEditingLink] = useState<LinkItem | null>(null);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
 
-  // Google Sheets Auth & Sync State
-  const [googleUser, setGoogleUser] = useState<User | null>(null);
+  // Google Sheets Direct Sync State
   const [isSyncingSheets, setIsSyncingSheets] = useState(false);
   const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [isSheetsSettingsOpen, setIsSheetsSettingsOpen] = useState(false);
 
   // Filter & Tampilan State
   const [searchQuery, setSearchQuery] = useState('');
@@ -70,113 +65,65 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
-  // Muat data lokal saat pertama kali
-  useEffect(() => {
-    const loaded = loadLinks();
-    setLinks(loaded);
-  }, []);
-
-  // Sinkronisasi data dari Google Sheets
-  const syncFromSheets = useCallback(async (token: string, currentLocalLinks: LinkItem[]) => {
+  // Fungsi membaca data langsung dari Google Spreadsheet publik pengguna
+  const loadDataFromGoogleSheet = useCallback(async (isSilent = false) => {
     setIsSyncingSheets(true);
     setSyncError(null);
     try {
-      const { links: sheetLinks, isNewSheet } = await fetchLinksFromGoogleSheet(token);
-
+      const sheetLinks = await fetchLinksDirectlyFromGoogleSheet();
       if (sheetLinks.length > 0) {
-        // Jika di Google Sheets sudah ada data, gunakan data dari Google Sheets
         setLinks(sheetLinks);
         saveLinks(sheetLinks);
         setLastSyncedAt(new Date());
-        addToast('success', `Berhasil menyinkronkan ${sheetLinks.length} tautan dari Google Sheets.`, 'Sinkronisasi Berhasil');
-      } else if (isNewSheet && currentLocalLinks.length > 0) {
-        // Jika sheet kosong tapi lokal ada data, upload data lokal ke sheet
-        await syncAllLinksToGoogleSheet(token, currentLocalLinks);
-        setLastSyncedAt(new Date());
-        addToast('success', `${currentLocalLinks.length} tautan lokal berhasil diunggah ke Google Sheets.`, 'Tersinkron ke Sheets');
+        if (!isSilent) {
+          addToast('success', `Berhasil memuat ${sheetLinks.length} tautan langsung dari Google Spreadsheet.`, 'Tersinkron dengan Database');
+        }
       } else {
         setLastSyncedAt(new Date());
+        if (!isSilent) {
+          addToast('info', 'Google Spreadsheet masih kosong. Anda dapat menambahkan tautan pertama Anda.', 'Spreadsheet Kosong');
+        }
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Gagal menyinkronkan Google Sheets';
+      const msg = err instanceof Error ? err.message : 'Gagal menghubungi Google Spreadsheet';
       setSyncError(msg);
-      addToast('error', msg, 'Gagal Sinkronisasi');
+      if (!isSilent) {
+        addToast('error', msg, 'Gagal Sinkronisasi');
+      }
     } finally {
       setIsSyncingSheets(false);
     }
   }, [addToast]);
 
-  // Inisialisasi Auth Listener
+  // Muat data lokal saat pertama kali, lalu otomatis tarik dari Google Spreadsheet
   useEffect(() => {
-    const unsubscribe = initAuth(
-      (user, token) => {
-        setGoogleUser(user);
-        syncFromSheets(token, loadLinks());
-      },
-      () => {
-        setGoogleUser(null);
-      }
-    );
-    return () => unsubscribe();
-  }, [syncFromSheets]);
-
-  // Login dengan Google
-  const handleGoogleLogin = async () => {
-    setIsSyncingSheets(true);
-    setSyncError(null);
-    try {
-      const result = await googleSignIn();
-      if (result) {
-        setGoogleUser(result.user);
-        await syncFromSheets(result.accessToken, links);
-        addToast('success', `Terhubung dengan Google: ${result.user.displayName || result.user.email}`, 'Koneksi Berhasil');
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Gagal masuk dengan akun Google';
-      setSyncError(msg);
-      addToast('error', msg, 'Login Dibatalkan/Gagal');
-    } finally {
-      setIsSyncingSheets(false);
+    const cached = loadLinks();
+    if (cached.length > 0) {
+      setLinks(cached);
     }
-  };
+    // Langsung sinkronkan dengan Google Spreadsheet publik
+    loadDataFromGoogleSheet(true);
+  }, [loadDataFromGoogleSheet]);
 
-  // Logout Google
-  const handleGoogleLogout = async () => {
-    try {
-      await googleLogout();
-      setGoogleUser(null);
-      setLastSyncedAt(null);
-      addToast('info', 'Koneksi Google Sheets diputuskan. Data lokal tetap tersimpan di peramban.', 'Koneksi Terputus');
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Gagal keluar';
-      addToast('error', msg, 'Error');
-    }
-  };
-
-  // Manual Refresh Sync
-  const handleManualSync = async () => {
-    const token = await getAccessToken();
-    if (!token) {
-      handleGoogleLogin();
-      return;
-    }
-    syncFromSheets(token, links);
-  };
-
-  // Helper untuk push pembaruan ke Google Sheets secara otomatis
-  const pushToSheetsIfConnected = async (newLinksList: LinkItem[], actionName: string) => {
-    const token = await getAccessToken();
-    if (token) {
+  // Helper untuk mengirim perubahan ke Google Sheets jika Webhook aktif
+  const pushChangeToWebhook = async (
+    action: 'add' | 'edit' | 'delete' | 'syncAll',
+    payload: { item?: LinkItem; id?: string; links?: LinkItem[] },
+    actionName: string
+  ) => {
+    const webhookUrl = getSavedWebhookUrl();
+    if (webhookUrl) {
       setIsSyncingSheets(true);
       try {
-        await syncAllLinksToGoogleSheet(token, newLinksList);
-        setLastSyncedAt(new Date());
-        setSyncError(null);
-        addToast('success', `${actionName} otomatis tersinkron ke Google Sheets.`, 'Tersinkron ke Database');
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : 'Gagal update Google Sheets';
-        setSyncError(msg);
-        addToast('warning', `Data tersimpan lokal, namun gagal update ke Google Sheets: ${msg}`, 'Peringatan Sinkronisasi');
+        const res = await sendActionToGoogleSheetsWebhook(action, payload, webhookUrl);
+        if (res.success) {
+          setLastSyncedAt(new Date());
+          addToast('success', `${actionName} otomatis terupdate di Google Sheets.`, 'Google Sheets Diperbarui');
+        } else {
+          addToast('warning', `Data tersimpan lokal, respon webhook: ${res.message || 'Gagal'}`, 'Catatan Sinkronisasi');
+        }
+      } catch (err) {
+        console.error(err);
       } finally {
         setIsSyncingSheets(false);
       }
@@ -190,13 +137,15 @@ export default function App() {
   ) => {
     if (id) {
       // Mode Edit
+      let updatedItem: LinkItem | null = null;
       const updatedLinks = links.map((item) => {
         if (item.id === id) {
-          return {
+          updatedItem = {
             ...item,
             ...linkData,
             updatedAt: new Date().toISOString(),
           };
+          return updatedItem;
         }
         return item;
       });
@@ -206,8 +155,10 @@ export default function App() {
       setIsAddModalOpen(false);
       addToast('success', `Materi "${linkData.title}" berhasil diperbarui.`, 'Berhasil Diperbarui');
 
-      // Sinkronisasi otomatis ke Google Sheets
-      await pushToSheetsIfConnected(updatedLinks, 'Perubahan data');
+      // Sinkronisasi otomatis ke Google Sheets via Webhook
+      if (updatedItem) {
+        await pushChangeToWebhook('edit', { item: updatedItem }, 'Perubahan materi');
+      }
     } else {
       // Mode Tambah Baru
       const newLink: LinkItem = {
@@ -221,28 +172,29 @@ export default function App() {
       setIsAddModalOpen(false);
       addToast('success', `Tautan "${linkData.title}" berhasil ditambahkan ke repositori.`, 'Materi Tersimpan');
 
-      // Sinkronisasi otomatis ke Google Sheets
-      await pushToSheetsIfConnected(updatedLinks, 'Penambahan tautan');
+      // Sinkronisasi otomatis ke Google Sheets via Webhook
+      await pushChangeToWebhook('add', { item: newLink }, 'Penambahan materi');
     }
   };
 
   // Hapus Link dengan konfirmasi (Otomatis Sync ke Sheets)
   const handleConfirmDelete = async () => {
     if (!deleteModalItem) return;
+    const deletedId = deleteModalItem.id;
     const deletedTitle = deleteModalItem.title;
-    const updatedLinks = links.filter((l) => l.id !== deleteModalItem.id);
+    const updatedLinks = links.filter((l) => l.id !== deletedId);
     setLinks(updatedLinks);
     saveLinks(updatedLinks);
 
-    if (editingLink?.id === deleteModalItem.id) {
+    if (editingLink?.id === deletedId) {
       setEditingLink(null);
     }
 
     setDeleteModalItem(null);
     addToast('info', `Materi "${deletedTitle}" telah dihapus.`, 'Tautan Dihapus');
 
-    // Sinkronisasi otomatis ke Google Sheets
-    await pushToSheetsIfConnected(updatedLinks, 'Penghapusan tautan');
+    // Sinkronisasi otomatis ke Google Sheets via Webhook
+    await pushChangeToWebhook('delete', { id: deletedId }, 'Penghapusan materi');
   };
 
   // Kosongkan seluruh data (Otomatis Sync ke Sheets)
@@ -253,11 +205,11 @@ export default function App() {
     setIsClearAllModalOpen(false);
     addToast('info', 'Semua data tautan telah berhasil dibersihkan.', 'Data Dikosongkan');
 
-    // Sinkronisasi otomatis ke Google Sheets
-    await pushToSheetsIfConnected([], 'Pembersihan database');
+    // Sinkronisasi otomatis ke Google Sheets via Webhook
+    await pushChangeToWebhook('syncAll', { links: [] }, 'Pembersihan database');
   };
 
-  // Impor Sukses (Otomatis Sync ke Sheets jika connected)
+  // Impor Sukses (Otomatis Sync ke Sheets)
   const handleImportSuccess = async (imported: LinkItem[], mode: 'merge' | 'replace') => {
     let finalLinks: LinkItem[] = [];
     if (mode === 'replace') {
@@ -274,8 +226,8 @@ export default function App() {
     saveLinks(finalLinks);
     addToast('success', `Berhasil memuat ${imported.length} materi pembelajaran.`, 'Impor Berhasil');
 
-    // Sinkronisasi otomatis ke Google Sheets
-    await pushToSheetsIfConnected(finalLinks, 'Impor data');
+    // Sinkronisasi otomatis ke Google Sheets via Webhook
+    await pushChangeToWebhook('syncAll', { links: finalLinks }, 'Impor data');
   };
 
   // Ekstraksi kategori unik beserta jumlah link
@@ -382,15 +334,14 @@ export default function App() {
 
       {/* Konten Utama */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8">
-        {/* 1. Bar Status Sinkronisasi Google Sheets */}
+        {/* 1. Bar Status Sinkronisasi Langsung ke Google Spreadsheet */}
         <GoogleSyncBar
-          user={googleUser}
           isSyncing={isSyncingSheets}
           lastSyncedAt={lastSyncedAt}
           syncError={syncError}
-          onLogin={handleGoogleLogin}
-          onLogout={handleGoogleLogout}
-          onManualSync={handleManualSync}
+          onRefreshData={() => loadDataFromGoogleSheet(false)}
+          onOpenSettings={() => setIsSheetsSettingsOpen(true)}
+          totalSyncedCount={links.length}
         />
 
         {/* 2. Tampilan Dashboard di Awal */}
@@ -472,6 +423,12 @@ export default function App() {
             </a>
           </div>
           <div className="flex flex-wrap items-center gap-4">
+            <button
+              onClick={() => setIsSheetsSettingsOpen(true)}
+              className="text-zinc-400 hover:text-zinc-200 transition-colors"
+            >
+              Pengaturan Sheets
+            </button>
             {links.length > 0 && (
               <button
                 onClick={() => setIsClearAllModalOpen(true)}
@@ -529,6 +486,16 @@ export default function App() {
         popularTags={popularTags}
       />
 
+      {/* Modal Pengaturan Sinkronisasi Google Sheets */}
+      <SheetsSettingsModal
+        isOpen={isSheetsSettingsOpen}
+        onClose={() => setIsSheetsSettingsOpen(false)}
+        links={links}
+        onWebhookSaved={() => {
+          addToast('success', 'URL Webhook berhasil disimpan. Sinkronisasi dua arah kini aktif!', 'Webhook Aktif');
+        }}
+      />
+
       {/* Dialog Konfirmasi Hapus Satu Link */}
       <ConfirmModal
         isOpen={!!deleteModalItem}
@@ -537,7 +504,7 @@ export default function App() {
         message={`Apakah Anda yakin ingin menghapus tautan materi "${deleteModalItem?.title}"?`}
         subMessage={
           deleteModalItem
-            ? `URL: ${deleteModalItem.url}${googleUser ? ' — Data juga akan otomatis dihapus dari Google Sheets.' : ''}`
+            ? `URL: ${deleteModalItem.url} — Data juga akan otomatis dihapus dari database.`
             : undefined
         }
         confirmLabel="Hapus Materi"
@@ -551,7 +518,7 @@ export default function App() {
         isOpen={isClearAllModalOpen}
         type="danger"
         title="Hapus Semua Data Tautan?"
-        message={`Aksi ini akan menghapus seluruh (${links.length}) materi tautan yang tersimpan.${googleUser ? ' Baris data di Google Sheets juga akan dikosongkan.' : ''} Pastikan Anda sudah mencadangkan data penting jika diperlukan.`}
+        message={`Aksi ini akan menghapus seluruh (${links.length}) materi tautan yang tersimpan. Pastikan Anda sudah mencadangkan data penting jika diperlukan.`}
         confirmLabel="Ya, Hapus Semua"
         cancelLabel="Batal"
         onConfirm={handleClearAllData}
